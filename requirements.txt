@@ -1,0 +1,37 @@
+# ─── Inventory Manager Pro — Python Dependencies ─────────────────────────────
+# Install all with:  pip install -r requirements.txt
+#
+# Tested on Python 3.10 / 3.11 / 3.12  (Windows 10/11)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── GUI ───────────────────────────────────────────────────────────────────────
+customtkinter==5.2.2          # Modern Tkinter UI framework
+darkdetect==0.8.0             # Auto dark/light mode (CustomTkinter dependency)
+
+# ── PDF Parsing ───────────────────────────────────────────────────────────────
+pdfplumber==0.11.0            # Table & text extraction from PDFs
+PyMuPDF==1.24.5               # (fitz) Robust PDF text extraction fallback
+
+# ── Image / OCR ───────────────────────────────────────────────────────────────
+Pillow==10.3.0                # Image processing
+pytesseract==0.3.13           # Python wrapper for Tesseract OCR engine
+#
+# !! IMPORTANT: pytesseract requires the Tesseract OCR engine to be installed.
+#    Download from:  https://github.com/UB-Mannheim/tesseract/wiki
+#    Install to   :  C:\Program Files\Tesseract-OCR\tesseract.exe
+#    Then add      :  C:\Program Files\Tesseract-OCR\  to your Windows PATH
+#    OR set in code: pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# ── Excel ─────────────────────────────────────────────────────────────────────
+openpyxl==3.1.4               # Read / write .xlsx files
+pandas==2.2.2                 # DataFrame operations for CSV / Excel consumption reports
+xlrd==2.0.1                   # Legacy .xls read support (pandas backend)
+
+# ── Fuzzy Matching ────────────────────────────────────────────────────────────
+rapidfuzz==3.9.1              # Fast fuzzy string matching (Levenshtein / token sort)
+
+# ── Date Parsing ──────────────────────────────────────────────────────────────
+python-dateutil==2.9.0        # Flexible date string parsing
+
+# ── Packaging (optional — only needed to build the .exe) ─────────────────────
+# pyinstaller==6.8.0          # Uncomment when building the standalone executable

@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+.env/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# App
+*.db
+*.db-wal
+*.db-shm
+.inventory_manager_config.json
+Master_Inventory.xlsx
+Current_Stock_*.xlsx
+
+# Logs
+*.log
