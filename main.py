@@ -22,7 +22,7 @@ else:
 sys.path.insert(0, str(BASE_DIR))
 
 from core.invoice_parser import InvoiceParser
-from core.excel_manager import ExcelManager
+from core.database_manager import DatabaseManager
 from core.consumption_processor import ConsumptionProcessor
 
 # ─── App Configuration ────────────────────────────────────────────────────────
@@ -233,7 +233,7 @@ class InventoryApp(ctk.CTk):
 
     def _setup_services(self):
         self.invoice_parser = InvoiceParser()
-        self.excel_manager  = ExcelManager()
+        self.excel_manager  = DatabaseManager()   # attribute kept for compatibility
         self.cons_processor = ConsumptionProcessor()
 
     # ── UI Construction ────────────────────────────────────────────────────
@@ -276,9 +276,11 @@ class InventoryApp(ctk.CTk):
         c = card.content
 
         self.master_picker = FilePickerRow(
-            c, "Master Excel File:",
-            placeholder="Select your Master Inventory .xlsx file",
-            filetypes=[("Excel Files", "*.xlsx *.xls"), ("All Files", "*.*")])
+            c, "Master Database:",
+            placeholder="Select your Master Inventory .db file",
+            filetypes=[("Inventory Database",   "*.db"),
+                       ("Legacy Excel Master",  "*.xlsx *.xls"),
+                       ("All Files",            "*.*")])
         self.master_picker.pack(fill="x", pady=(0, 8))
 
         self.output_dir_picker = DirPickerRow(
@@ -302,6 +304,13 @@ class InventoryApp(ctk.CTk):
                       hover_color="#1A3A2A",
                       command=self._create_new_master).pack(side="left", padx=(8, 0))
 
+        ctk.CTkButton(row, text="🔄  Migrate from Excel",
+                      width=170, height=32,
+                      font=("Segoe UI", 11), fg_color=SURFACE_BG,
+                      border_width=1, border_color=THEME_COLOR,
+                      hover_color="#1A3A2A",
+                      command=self._migrate_from_excel).pack(side="left", padx=(8, 0))
+
     # ── Section: Invoice Upload ─────────────────────────────────────────────
 
     def _build_invoice_section(self, parent):
@@ -311,7 +320,7 @@ class InventoryApp(ctk.CTk):
 
         info = ctk.CTkLabel(
             c,
-            text="Accepts PDF or image invoices. Extracts line items and updates the Master Excel with date-wise stock.",
+            text="Accepts PDF or image invoices. Extracts line items and updates the Master Database with date-wise stock.",
             font=("Segoe UI", 11), text_color=TEXT_MUTED, wraplength=800, justify="left")
         info.pack(anchor="w", pady=(0, 10))
 
@@ -431,18 +440,52 @@ class InventoryApp(ctk.CTk):
 
     def _create_new_master(self):
         path = filedialog.asksaveasfilename(
-            defaultextension=".xlsx",
-            filetypes=[("Excel Files", "*.xlsx")],
-            title="Save New Master Inventory File",
-            initialfile="Master_Inventory.xlsx")
+            defaultextension=".db",
+            filetypes=[("Inventory Database", "*.db")],
+            title="Create New Inventory Database",
+            initialfile="Master_Inventory.db")
         if not path:
             return
         try:
-            self.excel_manager.create_empty_master(path)
-            self.master_picker.set(path)
-            self.log.log(f"New Master Excel created: {path}", "success")
+            final = self.excel_manager.create_empty_master(path)
+            self.master_picker.set(final)
+            self.log.log(f"New database created: {final}", "success")
         except Exception as e:
-            self.log.log(f"Failed to create master: {e}", "error")
+            self.log.log(f"Failed to create database: {e}", "error")
+
+    # ── Migrate Excel → SQLite ─────────────────────────────────────────────
+
+    def _migrate_from_excel(self):
+        xlsx = filedialog.askopenfilename(
+            title="Select existing Master_Inventory.xlsx",
+            filetypes=[("Excel Files", "*.xlsx *.xls"), ("All Files", "*.*")])
+        if not xlsx:
+            return
+        db_path = filedialog.asksaveasfilename(
+            defaultextension=".db",
+            filetypes=[("Inventory Database", "*.db")],
+            title="Save migrated database as…",
+            initialfile="Master_Inventory.db")
+        if not db_path:
+            return
+
+        self.log.log(f"Migrating {Path(xlsx).name} → SQLite…", "info")
+
+        def _work():
+            try:
+                stats = self.excel_manager.migrate_from_excel(xlsx, db_path)
+                self.after(0, lambda: (
+                    self.master_picker.set(db_path),
+                    self.log.log(
+                        f"Migration complete ✔  |  {stats['items']} items  |  "
+                        f"{stats['receipts']} receipt rows  |  "
+                        f"{stats['consumption']} consumption rows",
+                        "success")))
+            except Exception as e:
+                self.after(0, lambda err=str(e):
+                           self.log.log(f"Migration error: {err}", "error"))
+
+        threading.Thread(target=_work, daemon=True).start()
 
     # ── Workflow: Invoice ──────────────────────────────────────────────────
 
@@ -455,7 +498,7 @@ class InventoryApp(ctk.CTk):
             messagebox.showwarning("Missing File", "Please select an invoice file.")
             return
         if not master_path or not Path(master_path).exists():
-            messagebox.showwarning("Missing Master", "Please select a valid Master Excel file.")
+            messagebox.showwarning("Missing Master", "Please select a valid Master Database file.")
             return
 
         self.upload_btn.set_busy(True)
@@ -500,7 +543,7 @@ class InventoryApp(ctk.CTk):
             messagebox.showwarning("Missing File", "Please select a consumption report file.")
             return
         if not master_path or not Path(master_path).exists():
-            messagebox.showwarning("Missing Master", "Please select a valid Master Excel file.")
+            messagebox.showwarning("Missing Master", "Please select a valid Master Database file.")
             return
 
         self.cons_btn.set_busy(True)
@@ -536,7 +579,7 @@ class InventoryApp(ctk.CTk):
         output_dir  = self.output_dir_picker.get()
 
         if not master_path or not Path(master_path).exists():
-            messagebox.showwarning("Missing Master", "Please select a valid Master Excel file.")
+            messagebox.showwarning("Missing Master", "Please select a valid Master Database file.")
             return
         if not output_dir:
             messagebox.showwarning("Missing Output", "Please choose an output folder.")
