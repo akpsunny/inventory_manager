@@ -28,7 +28,8 @@ inventory_manager/
 └── core/
     ├── __init__.py
     ├── invoice_parser.py        ← PDF / image invoice parser
-    ├── excel_manager.py         ← Master Excel read/write logic
+    ├── database_manager.py      ← SQLite storage + stock report writer
+    ├── excel_manager.py         ← Legacy Excel storage (kept as fallback)
     ├── consumption_processor.py ← Consumption report parser
     └── fuzzy_matcher.py         ← Fuzzy string matching utility
 ```
@@ -127,9 +128,11 @@ The GUI window will open. No browser, no server — fully local.
 ## 6. Using the Application
 
 ### First-Time Setup
-1. Click **Browse** next to **"Master Excel File"** and either:
-   - Select an existing `Master_Inventory.xlsx`, OR
-   - Click **"Create New Master"** to generate a blank one with the correct schema.
+1. Click **Browse** next to **"Master Database"** and either:
+   - Select an existing `Master_Inventory.db`, OR
+   - Click **"📂 Create New Master"** to generate a blank `.db` with the SQLite schema, OR
+   - Click **"🔄 Migrate from Excel"** to import an existing `Master_Inventory.xlsx`
+     (all items + date receipts + the running Consumed Qty) into a fresh `.db`.
 2. Click **Browse** next to **"Output Folder"** and choose where reports will be saved.
 3. Click **💾 Save Paths** — these paths are remembered across sessions.
 
@@ -137,7 +140,7 @@ The GUI window will open. No browser, no server — fully local.
 1. Click **Browse** next to **"Invoice File"** and select your PDF or image invoice.
 2. The system will auto-detect the invoice date. If it cannot, type it manually in `DD/MM/YYYY` format.
 3. Click **🚀 Process Invoice & Update Master**.
-4. Watch the Activity Log for confirmation. The master `.xlsx` is updated instantly.
+4. Watch the Activity Log for confirmation. The master `.db` is updated instantly (atomic SQLite transaction).
 
 ### Workflow: Uploading a Consumption Report (Step 2)
 1. Click **Browse** next to **"Consumption File"** and select a PDF, Excel, or CSV file.
@@ -185,6 +188,9 @@ pyinstaller ^
 ```
 
 > **Tip:** On PowerShell, replace the `^` line-continuation characters with `` ` ``
+>
+> **SQLite note:** `sqlite3` is part of Python's standard library, so it's
+> bundled into the .exe automatically — no `--hidden-import` needed.
 
 ### Step 3 — Find your .exe
 
@@ -220,31 +226,70 @@ The folder `dist\InventoryManagerPro\` will contain the `.exe` plus all supporti
 | `ModuleNotFoundError: No module named 'customtkinter'` | venv not activated | Run `venv\Scripts\activate` |
 | `TesseractNotFoundError` | Tesseract not in PATH | Add `C:\Program Files\Tesseract-OCR` to PATH |
 | `No items extracted from invoice` | Invoice is a scanned image inside a PDF | Use Image upload mode, or ensure Tesseract is installed |
-| Excel file shows "file is locked" | File open in Excel | Close the file in Excel before processing |
+| Excel stock report shows "file is locked" | Report file open in Excel | Close the previous report in Excel before generating a new one |
+| `database is locked` error | Another process / second copy of the app has the `.db` open | Close other instances; on Windows, check Task Manager for stray `InventoryManagerPro.exe` |
+| `database disk image is malformed` | Power loss while writing | Restore from your most recent backup `.db` |
 | Fuzzy matching gives wrong item | Names too different | Add the item manually to the master first; use consistent SKU codes |
 | .exe crashes on launch | Missing hidden import | Rerun PyInstaller and add `--hidden-import <module_name>` |
 | Date not auto-detected | Non-standard date format | Enter date manually in DD/MM/YYYY format |
-| `xlrd.XLRDError` on .xls files | Old-format Excel | Convert to .xlsx in Excel and re-upload |
+| `xlrd.XLRDError` on .xls consumption files | Old-format Excel | Convert to .xlsx in Excel and re-upload |
 
 ---
 
 ## 9. Data Schema Reference
 
-### Master Inventory Excel Columns
+The master file is now a **SQLite database** (`.db`). The Stock Report
+remains an Excel deliverable (`.xlsx`) with columns described at the
+bottom of this section.
 
+### SQLite Tables
+
+#### `items` — master record per SKU
 | Column | Type | Description |
 |---|---|---|
-| S.No. | Integer | Auto-incremented serial number |
-| Item Name | String | Full product name |
-| SKU Code | String | Unique product identifier (primary key) |
-| HSN/SAC | String | Harmonised System Nomenclature code |
-| GST Rate | String | e.g., "18%" |
-| Rate | Float | Unit price (₹) |
-| Measurement | String | Unit of measure (kg, pcs, box, etc.) |
-| [DD/MM/YYYY] | Float | Quantity received on this date (one column per invoice) |
-| … | Float | Additional date columns added automatically |
-| Consumed Qty | Float | Total consumed (from consumption reports) |
-| Available Qty | Float | Computed in Current Stock report |
+| id | INTEGER PK | Auto-incremented |
+| item_name | TEXT | Full product name (required) |
+| sku_code | TEXT | Unique product identifier (may be empty) |
+| hsn_sac | TEXT | Harmonised System Nomenclature code |
+| gst_rate | TEXT | e.g., `"18%"` |
+| rate | REAL | Unit price (₹) |
+| measurement | TEXT | Unit of measure (kg, pcs, box, etc.) |
+| created_at / updated_at | TEXT | ISO timestamps |
+
+#### `invoice_receipts` — one row per (item, date)
+| Column | Type | Description |
+|---|---|---|
+| id | INTEGER PK | Auto-incremented |
+| item_id | INTEGER FK → items.id | Cascade-deleted with parent item |
+| receipt_date | TEXT | `DD/MM/YYYY` |
+| quantity | REAL | Quantity received |
+| source_file | TEXT | Optional, name of the invoice file |
+
+`UNIQUE(item_id, receipt_date)` — multiple invoices on the same day
+accumulate via UPSERT, so quantities add up safely.
+
+#### `consumption` — append-only consumption log
+| Column | Type | Description |
+|---|---|---|
+| id | INTEGER PK | Auto-incremented |
+| item_id | INTEGER FK → items.id | Cascade-deleted with parent item |
+| quantity | REAL | Quantity consumed |
+| source_file | TEXT | Optional, name of the consumption report |
+| recorded_at | TEXT | ISO timestamp |
+
+#### `meta` — key/value housekeeping
+Stores `schema_version`, `created_at`, and other settings.
+
+### Current Stock Report Columns (Excel output)
+
+| Column | Source |
+|---|---|
+| S.No. | Output row number |
+| Item Name … Measurement | From `items` |
+| Total Received | `Σ invoice_receipts.quantity` per item |
+| Consumed Qty | `Σ consumption.quantity` per item |
+| Available Qty | `max(0, Total Received − Consumed Qty)` |
+| Status | `In Stock` / `Low Stock` (≤5) / `Out of Stock` (0) |
 
 ### Consumption Report Columns (minimum required)
 - **Item Name** or **SKU Code** — at least one identifier
@@ -265,12 +310,25 @@ Items below 65% similarity are logged as **unmatched** and require manual review
 - Always use **SKU Codes** on your invoices — they are the most reliable matching key.
 - Keep item names consistent across suppliers to maximise fuzzy-match accuracy.
 - Process invoices in **date order** — the system handles out-of-order dates but
-  the master will be cleaner if dates are sequential.
-- Back up `Master_Inventory.xlsx` regularly (e.g., weekly copy to a dated folder).
+  the database will be cleaner if dates are sequential.
+- Back up `Master_Inventory.db` regularly (e.g., weekly copy to a dated folder).
+  A single `.db` file copy is a complete backup.
+
+### SQLite Sidecar Files
+SQLite runs in **WAL mode** for safer concurrent reads/writes. While the app
+is open you may see two extra files next to your `.db`:
+
+  - `Master_Inventory.db-wal`  — write-ahead log
+  - `Master_Inventory.db-shm`  — shared memory file
+
+These are **normal**. They merge back into the main `.db` on clean close.
+Don't delete them while the app is running.
 
 ### Multiple Invoices per Day
-The system **adds** to the date column if the same date already exists.
-You can safely upload multiple invoices from the same date — quantities accumulate correctly.
+The system **adds** to the existing receipt if the same `(item, date)` already
+exists in `invoice_receipts` (enforced by a `UNIQUE` constraint + UPSERT).
+You can safely upload multiple invoices from the same date — quantities
+accumulate correctly.
 
 ### Negative Stock
 The Current Stock report shows **0** (not negative) as the minimum for Available Qty.
