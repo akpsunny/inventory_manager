@@ -76,6 +76,29 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS processed_invoices (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_number  TEXT    DEFAULT '',     -- e.g. 'PF2511DL-0000876'; may be ''
+    invoice_date    TEXT    DEFAULT '',     -- DD/MM/YYYY
+    file_name       TEXT    DEFAULT '',     -- basename only, not full path
+    items_count     INTEGER DEFAULT 0,
+    processed_at    TEXT    DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_proc_inv_lookup
+    ON processed_invoices(invoice_number, invoice_date);
+CREATE INDEX IF NOT EXISTS idx_proc_inv_file
+    ON processed_invoices(file_name, invoice_date);
+
+CREATE TABLE IF NOT EXISTS manual_adjustments (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id     INTEGER NOT NULL,
+    delta_qty   REAL    NOT NULL,            -- positive = found stock; negative = damaged/missing
+    note        TEXT    DEFAULT '',
+    adjusted_at TEXT    DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_adjustments_item ON manual_adjustments(item_id);
 """
 
 # ─── Styling (for the Excel STOCK REPORT only) ────────────────────────────────
@@ -133,11 +156,27 @@ class DatabaseManager:
     # ── Connection ─────────────────────────────────────────────────────────
 
     def _connect(self, db_path: str) -> sqlite3.Connection:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
-        return conn
+        p = Path(db_path)
+        # Catch a common mistake: pointing at a legacy Excel master directly.
+        if p.suffix.lower() in {".xlsx", ".xls"}:
+            raise ValueError(
+                f"'{p.name}' is an Excel file, not a SQLite database. "
+                "Use 'Migrate from Excel' in the Configuration section to "
+                "convert it to a .db file, then select the new .db here."
+            )
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA journal_mode = WAL")
+            return conn
+        except sqlite3.DatabaseError as e:
+            raise ValueError(
+                f"'{p.name}' is not a valid SQLite database ({e}). "
+                "If this is a legacy Excel master, use 'Migrate from Excel' "
+                "to convert it; otherwise create a fresh one via "
+                "'Create New Master'."
+            ) from e
 
     def _ensure_schema(self, conn: sqlite3.Connection):
         conn.executescript(SCHEMA_SQL)
@@ -160,6 +199,275 @@ class DatabaseManager:
             conn.commit()
         log.info("Created new database: %s", p)
         return str(p)
+
+    # ── Reset database ─────────────────────────────────────────────────────
+
+    def reset_database(self, db_path: str) -> dict:
+        """
+        Delete all data from items, invoice_receipts, consumption,
+        processed_invoices, and manual_adjustments. Keeps the database file,
+        the schema, and the `meta` table intact, so the user's selected
+        master path remains valid. Autoincrement counters are also reset so
+        the next inserts start from id=1.
+
+        Returns
+        -------
+        dict with the row counts that existed BEFORE the reset:
+          {"items": int, "receipts": int, "consumption": int,
+           "processed_invoices": int, "adjustments": int}
+        """
+        with self._connect(db_path) as conn:
+            self._ensure_schema(conn)
+            counts = {
+                "items":              conn.execute("SELECT COUNT(*) FROM items").fetchone()[0],
+                "receipts":           conn.execute("SELECT COUNT(*) FROM invoice_receipts").fetchone()[0],
+                "consumption":        conn.execute("SELECT COUNT(*) FROM consumption").fetchone()[0],
+                "processed_invoices": conn.execute("SELECT COUNT(*) FROM processed_invoices").fetchone()[0],
+                "adjustments":        conn.execute("SELECT COUNT(*) FROM manual_adjustments").fetchone()[0],
+            }
+            # Order matters even with FK cascade off — children first.
+            conn.execute("DELETE FROM manual_adjustments")
+            conn.execute("DELETE FROM consumption")
+            conn.execute("DELETE FROM invoice_receipts")
+            conn.execute("DELETE FROM items")
+            # processed_invoices has no FK to items; clearing it lets the user
+            # re-process the same invoice after a deliberate full reset.
+            conn.execute("DELETE FROM processed_invoices")
+            conn.execute(
+                "DELETE FROM sqlite_sequence "
+                "WHERE name IN ('items','invoice_receipts','consumption',"
+                "'processed_invoices','manual_adjustments')")
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)",
+                ("reset_at", datetime.now().isoformat()))
+            conn.commit()
+        log.info("Database reset: %s | cleared %s", db_path, counts)
+        return counts
+
+    # ── Inventory snapshot (for in-app data browser) ───────────────────────
+
+    def get_inventory_snapshot(self, db_path: str) -> list[dict]:
+        """
+        Return every item with its computed totals, suitable for displaying in
+        a read-only table in the UI. One dict per item with keys:
+          id, item_name, sku_code, hsn_sac, gst_rate, rate, measurement,
+          total_received, total_consumed, adjustments, available
+        where available = total_received - total_consumed + adjustments.
+        adjustments is the algebraic sum of manual stock corrections.
+        """
+        with self._connect(db_path) as conn:
+            self._ensure_schema(conn)
+            rows = conn.execute("""
+                SELECT
+                  i.id, i.item_name, i.sku_code, i.hsn_sac, i.gst_rate,
+                  i.rate, i.measurement,
+                  COALESCE((SELECT SUM(quantity)  FROM invoice_receipts
+                            WHERE item_id = i.id), 0) AS total_received,
+                  COALESCE((SELECT SUM(quantity)  FROM consumption
+                            WHERE item_id = i.id), 0) AS total_consumed,
+                  COALESCE((SELECT SUM(delta_qty) FROM manual_adjustments
+                            WHERE item_id = i.id), 0) AS total_adjustments
+                FROM items i
+                ORDER BY i.id
+            """).fetchall()
+
+        snapshot = []
+        for r in rows:
+            received    = float(r["total_received"]    or 0)
+            consumed    = float(r["total_consumed"]    or 0)
+            adjustments = float(r["total_adjustments"] or 0)
+            snapshot.append({
+                "id":             r["id"],
+                "item_name":      r["item_name"] or "",
+                "sku_code":       r["sku_code"]  or "",
+                "hsn_sac":        r["hsn_sac"]   or "",
+                "gst_rate":       r["gst_rate"]  or "",
+                "rate":           float(r["rate"] or 0),
+                "measurement":    r["measurement"] or "",
+                "total_received": received,
+                "total_consumed": consumed,
+                "adjustments":    adjustments,
+                "available":      max(0.0, received - consumed + adjustments),
+            })
+        return snapshot
+
+    # ── Item CRUD (used by the data browser) ───────────────────────────────
+
+    # Whitelist of columns the UI is allowed to update.  This guards against
+    # accidentally writing to `id`, timestamps, or arbitrary names if the
+    # caller passes a wider dict.
+    _EDITABLE_ITEM_COLUMNS = {
+        "item_name", "sku_code", "hsn_sac",
+        "gst_rate", "rate", "measurement",
+    }
+
+    def update_item(self, db_path: str, item_id: int, **fields) -> None:
+        """
+        Update one item by id.  Only columns in _EDITABLE_ITEM_COLUMNS are
+        respected; unknown keys are silently ignored.  Setting `item_name`
+        to an empty value is rejected (every item must have a name).
+        """
+        clean = {k: v for k, v in fields.items()
+                 if k in self._EDITABLE_ITEM_COLUMNS}
+        if "item_name" in clean and not str(clean["item_name"]).strip():
+            raise ValueError("Item name cannot be empty.")
+        if "rate" in clean:
+            clean["rate"] = max(0.0, float(clean["rate"] or 0))
+        if not clean:
+            return
+
+        set_clause = ", ".join(f"{c} = ?" for c in clean)
+        params     = list(clean.values()) + [
+            datetime.now().isoformat(), int(item_id)]
+        with self._connect(db_path) as conn:
+            self._ensure_schema(conn)
+            cur = conn.execute(
+                f"UPDATE items SET {set_clause}, updated_at = ? WHERE id = ?",
+                params)
+            if cur.rowcount == 0:
+                raise ValueError(f"No item with id={item_id}")
+            conn.commit()
+        log.info("update_item id=%s fields=%s", item_id, list(clean))
+
+    def delete_item(self, db_path: str, item_id: int) -> None:
+        """
+        Permanently delete an item and all its receipts, consumption rows,
+        and manual adjustments (via FK cascade).  Irreversible — callers
+        must confirm with the user first.
+        """
+        with self._connect(db_path) as conn:
+            self._ensure_schema(conn)
+            cur = conn.execute("DELETE FROM items WHERE id = ?", (int(item_id),))
+            if cur.rowcount == 0:
+                raise ValueError(f"No item with id={item_id}")
+            conn.commit()
+        log.info("delete_item id=%s", item_id)
+
+    def add_item(self, db_path: str, **fields) -> int:
+        """
+        Insert a new item.  Returns the new id.  item_name is required;
+        everything else has a sensible default.
+        """
+        name = str(fields.get("item_name", "")).strip()
+        if not name:
+            raise ValueError("Item name is required.")
+        sku  = str(fields.get("sku_code", "")).strip()
+        with self._connect(db_path) as conn:
+            self._ensure_schema(conn)
+            cur = conn.execute(
+                "INSERT INTO items "
+                "(item_name, sku_code, hsn_sac, gst_rate, rate, measurement) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (name, sku,
+                 str(fields.get("hsn_sac", "")).strip(),
+                 str(fields.get("gst_rate", "")).strip(),
+                 max(0.0, float(fields.get("rate", 0) or 0)),
+                 str(fields.get("measurement", "")).strip()))
+            new_id = cur.lastrowid
+            conn.commit()
+        log.info("add_item id=%s name=%r sku=%r", new_id, name, sku)
+        return new_id
+
+    def add_manual_adjustment(
+        self, db_path: str, item_id: int, delta_qty: float, note: str = ""
+    ) -> None:
+        """
+        Append a signed quantity adjustment to manual_adjustments.
+        Positive delta = stock found / correction up.
+        Negative delta = damaged / lost / correction down.
+        Each call appends a new row, so the full history is preserved and
+        auditable.  Available qty is recomputed from the sum.
+        """
+        if abs(float(delta_qty)) < 1e-9:
+            return   # zero-delta is a no-op, not an error
+        with self._connect(db_path) as conn:
+            self._ensure_schema(conn)
+            exists = conn.execute(
+                "SELECT 1 FROM items WHERE id = ?", (int(item_id),)
+            ).fetchone()
+            if not exists:
+                raise ValueError(f"No item with id={item_id}")
+            conn.execute(
+                "INSERT INTO manual_adjustments (item_id, delta_qty, note) "
+                "VALUES (?, ?, ?)",
+                (int(item_id), float(delta_qty), str(note or "").strip()))
+            conn.commit()
+        log.info("add_manual_adjustment id=%s delta=%+.2f note=%r",
+                 item_id, delta_qty, note)
+
+    # ── Duplicate-invoice detection ────────────────────────────────────────
+
+    def find_processed_invoice(
+        self,
+        db_path:        str,
+        invoice_number: str,
+        invoice_date:   str,
+        file_name:      str,
+    ) -> Optional[dict]:
+        """
+        Check whether this invoice has already been logged. Match priority:
+          1. If invoice_number is non-empty: match on (invoice_number, invoice_date).
+          2. Otherwise fall back to (file_name, invoice_date).
+        Returns the matching row as a dict (latest first by id), or None when
+        no duplicate is found. Returns None unconditionally if invoice_date
+        is empty — without a date we cannot dedupe reliably.
+        """
+        if not invoice_date:
+            return None
+
+        invoice_number = (invoice_number or "").strip()
+        file_name      = (file_name or "").strip()
+
+        with self._connect(db_path) as conn:
+            self._ensure_schema(conn)
+            if invoice_number:
+                row = conn.execute(
+                    "SELECT * FROM processed_invoices "
+                    "WHERE invoice_number = ? AND invoice_date = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (invoice_number, invoice_date)
+                ).fetchone()
+                if row:
+                    return dict(row)
+            if file_name:
+                row = conn.execute(
+                    "SELECT * FROM processed_invoices "
+                    "WHERE file_name = ? AND invoice_date = ? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (file_name, invoice_date)
+                ).fetchone()
+                if row:
+                    return dict(row)
+        return None
+
+    def log_processed_invoice(
+        self,
+        db_path:        str,
+        invoice_number: str,
+        invoice_date:   str,
+        file_name:      str,
+        items_count:    int,
+    ) -> None:
+        """
+        Record that an invoice was successfully processed.
+        Always appends a new row — re-processed invoices show up multiple
+        times with distinct processed_at timestamps, which is useful when
+        auditing how a quantity total accumulated.
+        """
+        with self._connect(db_path) as conn:
+            self._ensure_schema(conn)
+            conn.execute(
+                "INSERT INTO processed_invoices "
+                "(invoice_number, invoice_date, file_name, items_count) "
+                "VALUES (?, ?, ?, ?)",
+                ((invoice_number or "").strip(),
+                 (invoice_date   or "").strip(),
+                 (file_name      or "").strip(),
+                 int(items_count or 0))
+            )
+            conn.commit()
+        log.info("Logged processed invoice: number=%r date=%r file=%r items=%d",
+                 invoice_number, invoice_date, file_name, items_count)
 
     # ── Update with invoice ────────────────────────────────────────────────
 
@@ -188,7 +496,8 @@ class DatabaseManager:
                     continue
 
                 item_id = self._find_item_id(sku, item_name,
-                                             sku_index, name_index)
+                                             sku_index, name_index,
+                                             strict_sku=True)
 
                 if item_id is None:
                     item_id = self._insert_item(conn, item)
@@ -426,27 +735,58 @@ class DatabaseManager:
         return sku_idx, name_idx
 
     def _find_item_id(self, sku: str, item_name: str,
-                      sku_index: dict, name_index: dict) -> Optional[int]:
+                      sku_index: dict, name_index: dict,
+                      *, strict_sku: bool = False) -> Optional[int]:
+        """
+        Look up an existing item by SKU then by name.
+
+        strict_sku=False (default, used by consumption matching):
+          Tries exact SKU, fuzzy SKU (≥90), exact name, fuzzy name (≥78).
+          Fuzzy fallback is needed when the user's consumption report has
+          slightly different wording than the invoice.
+
+        strict_sku=True (used by invoice ingestion):
+          Only exact matches count. SKU path: exact SKU; if SKU given but no
+          match → return None (the caller inserts a new item). Name path:
+          exact name; if name given but no exact match → return None. No
+          fuzzy step on either axis.
+
+          Rationale: supplier-provided SKUs are authoritative identifiers.
+          Fuzzy-merging SKUHDR-0001402 (Grey Ceramics) into SKUHDR-0001403
+          (White Ceramics) collapses distinct products. The same applies to
+          names — 'AC-143 Ceramic Pot' fuzzy-matches 'AB-184 Ceramic Pot' at
+          ~89% but they are completely different products. When a row has no
+          SKU (e.g. because the source PDF column was empty and we cleared a
+          bogus value upstream), the right behaviour is to insert it as a
+          new item, not absorb it into an unrelated lookalike.
+        """
         sku_norm  = sku.strip().lower()
         name_norm = item_name.strip().lower()
 
-        if sku_norm and sku_norm in sku_index:
-            return sku_index[sku_norm]
-        if sku_norm and sku_index:
-            best, _ = self._matcher.best_match(
-                sku_norm, list(sku_index.keys()), threshold=90)
-            if best:
-                return sku_index[best]
-        if name_norm and name_norm in name_index:
-            return name_index[name_norm]
-        if name_norm and name_index:
-            best, score = self._matcher.best_match(
-                name_norm, list(name_index.keys()),
-                threshold=THRESHOLD_MEDIUM)
-            if best:
-                log.debug("Fuzzy match '%s' → '%s' (%d)",
-                          item_name, best, score)
-                return name_index[best]
+        if sku_norm:
+            if sku_norm in sku_index:
+                return sku_index[sku_norm]
+            if strict_sku:
+                return None
+            if sku_index:
+                best, _ = self._matcher.best_match(
+                    sku_norm, list(sku_index.keys()), threshold=90)
+                if best:
+                    return sku_index[best]
+
+        if name_norm:
+            if name_norm in name_index:
+                return name_index[name_norm]
+            if strict_sku:
+                return None
+            if name_index:
+                best, score = self._matcher.best_match(
+                    name_norm, list(name_index.keys()),
+                    threshold=THRESHOLD_MEDIUM)
+                if best:
+                    log.debug("Fuzzy match '%s' → '%s' (%d)",
+                              item_name, best, score)
+                    return name_index[best]
         return None
 
     def _insert_item(self, conn, item: dict) -> int:
